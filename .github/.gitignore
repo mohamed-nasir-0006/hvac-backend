@@ -1,0 +1,23 @@
+cat > hvac-backend/.gitignore << 'EOF'
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# ChromaDB persistent data
+chroma_data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+EOF

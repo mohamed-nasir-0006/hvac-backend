@@ -1,0 +1,14 @@
+[
+  {
+    "id": "hvac-basics-001",
+    "title": "HVAC Setback Mode",
+    "category": "energy_saving",
+    "text": "Setback mode reduces HVAC energy usage by allowing temperature to drift when the building is unoccupied. Typical approach: raise cooling setpoint and lower heating setpoint during off-hours. This can save 10-15% on energy bills annually. Modern systems use occupancy sensors to switch between comfort and setback modes automatically."
+  },
+  {
+    "id": "hvac-basics-002",
+    "title": "Zoned HVAC Systems",
+    "category": "system_design",
+    "text": "Zoned HVAC divides a building into independent climate zones, each with its own thermostat and damper. Benefits include personalized comfort, reduced energy waste, and the ability to condition only occupied areas. Common zone types: perimeter zones (near windows), interior zones, and server/equipment rooms with dedicated cooling."
+  }
+]

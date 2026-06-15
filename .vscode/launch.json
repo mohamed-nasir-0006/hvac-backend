@@ -1,0 +1,23 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug FastAPI (uvicorn)",
+      "type": "python",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": [
+        "app:app",
+        "--reload",
+        "--port",
+        "8000"
+      ],
+      "jinja": true,
+      "env": {
+        "OPENAI_API_KEY": "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"
+      },
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ]
+}
