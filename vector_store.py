@@ -15,6 +15,11 @@ COLLECTION_NAME = "hvac_knowledge"
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
 EMBED_MODEL = "nomic-embed-text"
 KB_PATH = Path(__file__).parent / "kb_docs.json"
+# =========================
+# Ollama config
+# =========================
+OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+GEN_MODEL = "llama3"
 
 
 # =========================
@@ -178,6 +183,114 @@ async def retrieve(
 
     return chunks
 
+# =========================
+# Ingest a single document via API
+# =========================
+async def ingest_document(
+    source_id: str,
+    title: str,
+    text: str,
+    category: str = "general",
+) -> Dict[str, Any]:
+    """
+    Chunk, embed, and store a single document into ChromaDB.
+    Returns info about what was stored.
+    """
+    collection = get_collection()
+
+    chunks = chunk_text(text)
+    if not chunks:
+        return {"status": "skipped", "reason": "empty text", "chunks_added": 0}
+
+    ids = []
+    documents = []
+    metadatas = []
+
+    for idx, ch in enumerate(chunks, start=1):
+        chunk_id = f"{source_id}::chunk{idx}"
+        ids.append(chunk_id)
+        documents.append(ch)
+        metadatas.append({
+            "source_id": source_id,
+            "title": title,
+            "category": category,
+            "chunk_index": str(idx),
+        })
+
+    # Embed
+    embeddings = await ollama_embed(documents)
+
+    # Upsert (update if same ID exists, insert if new)
+    collection.upsert(
+        ids=ids,
+        documents=documents,
+        embeddings=embeddings,
+        metadatas=metadatas,
+    )
+
+    return {
+        "status": "success",
+        "source_id": source_id,
+        "title": title,
+        "category": category,
+        "chunks_added": len(chunks),
+        "total_chunks_in_db": collection.count(),
+    }
+
+
+# =========================
+# Delete a document by source_id
+# =========================
+def delete_document(source_id: str) -> Dict[str, Any]:
+    """
+    Remove all chunks belonging to a source_id from ChromaDB.
+    """
+    collection = get_collection()
+
+    # Find all chunks with this source_id
+    results = collection.get(
+        where={"source_id": source_id},
+    )
+
+    if not results["ids"]:
+        return {"status": "not_found", "source_id": source_id, "chunks_deleted": 0}
+
+    collection.delete(ids=results["ids"])
+
+    return {
+        "status": "deleted",
+        "source_id": source_id,
+        "chunks_deleted": len(results["ids"]),
+        "total_chunks_in_db": collection.count(),
+    }
+
+
+# =========================
+# List all documents (unique source_ids)
+# =========================
+def list_documents() -> List[Dict[str, str]]:
+    """
+    List all unique documents in the collection.
+    """
+    collection = get_collection()
+
+    if collection.count() == 0:
+        return []
+
+    all_data = collection.get()
+    seen = {}
+
+    for meta in all_data["metadatas"]:
+        sid = meta.get("source_id", "unknown")
+        if sid not in seen:
+            seen[sid] = {
+                "source_id": sid,
+                "title": meta.get("title", "unknown"),
+                "category": meta.get("category", "general"),
+            }
+
+    return list(seen.values())
+
 
 # =========================
 # Utility: list all chunks (for debugging)
@@ -190,3 +303,38 @@ def get_collection_info() -> Dict[str, Any]:
         "count": collection.count(),
         "persist_dir": str(CHROMA_DIR),
     }
+
+async def ollama_chat(messages: List[Dict[str, str]]) -> str:
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            OLLAMA_CHAT_URL,
+            json={"model": GEN_MODEL, "messages": messages, "stream": False},
+        )
+        resp.raise_for_status()
+        return resp.json()["message"]["content"]
+
+def format_context(chunks: List[Dict[str, Any]]) -> str:
+    if not chunks:
+        return "CONTEXT: (none)\n"
+    lines = ["CONTEXT:"]
+    for i, c in enumerate(chunks, start=1):
+        meta = c.get("metadata", {})
+        title = meta.get("title", "unknown")
+        source = meta.get("source_id", "unknown")
+        lines.append(f"[{i}] {title} ({source}): {c['text']}")
+    return "\n".join(lines) + "\n"
+
+def parse_llm_json(raw_text: str) -> Dict[str, Any]:
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {
+            "intent": "unclear",
+            "reply": raw_text,
+            "confidence": 0.0,
+        }

@@ -1,12 +1,20 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Literal, Dict, Any, Tuple
 import httpx
 import json
 from intents import get_intent_prompt_block
-from vector_store import ingest_kb, retrieve, get_collection_info
-
+from file_parser import extract_text
+from vector_store import (
+    ingest_kb,
+    ingest_document,
+    retrieve,
+    get_collection_info,
+    delete_document,
+    list_documents,
+    format_context, ollama_chat, parse_llm_json
+)
 # =========================
 # FastAPI app + CORS
 # =========================
@@ -50,11 +58,17 @@ class ChatResponse(BaseModel):
     history: List[Msg] = Field(default_factory=list)
     context_used: Optional[List[Dict[str, Any]]] = None
 
-# =========================
-# Ollama config
-# =========================
-OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-GEN_MODEL = "llama3"
+class IngestRequest(BaseModel):
+    source_id: str = Field(..., description="Unique ID for this document")
+    title: str = Field(..., description="Document title")
+    text: str = Field(..., description="Document content")
+    category: str = Field(default="general", description="Category for filtering")
+
+class BulkIngestRequest(BaseModel):
+    documents: List[IngestRequest]
+
+class DeleteRequest(BaseModel):
+    source_id: str    
 
 INTENT_BLOCK = get_intent_prompt_block()
 
@@ -86,44 +100,6 @@ RULES:
 - For general HVAC knowledge questions, set intent to "general_question".
 - Use the CONTEXT (retrieved documents) to answer knowledge questions.
 """
-
-# =========================
-# Helpers
-# =========================
-async def ollama_chat(messages: List[Dict[str, str]]) -> str:
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
-            OLLAMA_CHAT_URL,
-            json={"model": GEN_MODEL, "messages": messages, "stream": False},
-        )
-        resp.raise_for_status()
-        return resp.json()["message"]["content"]
-
-def format_context(chunks: List[Dict[str, Any]]) -> str:
-    if not chunks:
-        return "CONTEXT: (none)\n"
-    lines = ["CONTEXT:"]
-    for i, c in enumerate(chunks, start=1):
-        meta = c.get("metadata", {})
-        title = meta.get("title", "unknown")
-        source = meta.get("source_id", "unknown")
-        lines.append(f"[{i}] {title} ({source}): {c['text']}")
-    return "\n".join(lines) + "\n"
-
-def parse_llm_json(raw_text: str) -> Dict[str, Any]:
-    text = raw_text.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        text = "\n".join(lines).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return {
-            "intent": "unclear",
-            "reply": raw_text,
-            "confidence": 0.0,
-        }
 
 # =========================
 # Startup — ingest KB into ChromaDB
@@ -213,3 +189,105 @@ async def chat(req: ChatRequest):
             history=new_history,
             context_used=None,
         )
+    
+# =========================
+# Document Management Routes
+# =========================
+
+@app.post("/ingest")
+async def ingest_single(req: IngestRequest):
+    """Add a single document to the knowledge base."""
+    result = await ingest_document(
+        source_id=req.source_id,
+        title=req.title,
+        text=req.text,
+        category=req.category,
+    )
+    return result
+
+
+@app.post("/ingest/bulk")
+async def ingest_bulk(req: BulkIngestRequest):
+    """Add multiple documents at once."""
+    results = []
+    for doc in req.documents:
+        result = await ingest_document(
+            source_id=doc.source_id,
+            title=doc.title,
+            text=doc.text,
+            category=doc.category,
+        )
+        results.append(result)
+
+    total_chunks = sum(r.get("chunks_added", 0) for r in results)
+    return {
+        "status": "success",
+        "documents_processed": len(results),
+        "total_chunks_added": total_chunks,
+        "details": results,
+    }
+
+
+@app.get("/documents")
+async def get_documents():
+    """List all documents in the knowledge base."""
+    docs = list_documents()
+    return {"documents": docs, "count": len(docs)}
+
+
+@app.delete("/documents/{source_id}")
+async def remove_document(source_id: str):
+    """Delete a document and all its chunks."""
+    result = delete_document(source_id)
+    return result    
+
+# =========================
+# File Upload Route
+# =========================
+
+@app.post("/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    category: str = Form(default="general"),
+):
+    """
+    Upload a PDF, TXT, or DOCX file.
+    Extracts text → chunks → embeds → stores in ChromaDB.
+    """
+    # Validate file type
+    allowed_types = [".pdf", ".docx", ".txt"]
+    file_ext = "." + file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+
+    if file_ext not in allowed_types:
+        return {
+            "status": "error",
+            "message": f"Unsupported file type: {file_ext}. Allowed: {', '.join(allowed_types)}"
+        }
+
+    # Read file content
+    file_bytes = await file.read()
+
+    # Extract text
+    try:
+        text = extract_text(file.filename, file_bytes)
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to extract text: {str(e)}"}
+
+    if not text.strip():
+        return {"status": "error", "message": "No text could be extracted from the file."}
+
+    # Generate source_id from filename
+    source_id = file.filename.rsplit(".", 1)[0].replace(" ", "-").lower()
+
+    # Ingest into ChromaDB
+    result = await ingest_document(
+        source_id=source_id,
+        title=file.filename,
+        text=text,
+        category=category,
+    )
+
+    result["extracted_text_length"] = len(text)
+    result["original_filename"] = file.filename
+
+    return result
