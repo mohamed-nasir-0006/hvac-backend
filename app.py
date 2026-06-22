@@ -15,6 +15,15 @@ from vector_store import (
     list_documents,
     format_context, ollama_chat, parse_llm_json
 )
+from memory import (
+    init_db,
+    create_session,
+    save_message,
+    get_session_messages,
+    get_session_history,
+    list_sessions,
+    delete_session,
+)
 # =========================
 # FastAPI app + CORS
 # =========================
@@ -41,7 +50,8 @@ class Msg(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    history: List[Msg] = Field(default_factory=list)
+    history: List[Msg] = []
+    session_id: str | None = None 
 
 class ParsedIntent(BaseModel):
     intent: str = "unclear"
@@ -54,9 +64,10 @@ class ParsedIntent(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
-    parsed: Optional[ParsedIntent] = None
-    history: List[Msg] = Field(default_factory=list)
-    context_used: Optional[List[Dict[str, Any]]] = None
+    parsed: ParsedIntent | None
+    history: List[Msg]
+    context_used: list | None = None
+    session_id: str | None = None 
 
 class IngestRequest(BaseModel):
     source_id: str = Field(..., description="Unique ID for this document")
@@ -107,6 +118,7 @@ RULES:
 @app.on_event("startup")
 async def startup():
     count = await ingest_kb()
+    init_db()
     print(f"[Startup] ChromaDB ready with {count} chunks.")
 
 # =========================
@@ -129,23 +141,34 @@ async def kb_reload():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    # 1) Retrieve context from ChromaDB
+    # ===== NEW: Session management =====
+    session_id = req.session_id
+    if not session_id:
+        session = create_session()
+        session_id = session["session_id"]
+    # Load history from DB if resuming, otherwise use frontend history
+    if req.session_id:
+        history_dicts = get_session_history(session_id)
+        history_msgs = [Msg(role=h["role"], content=h["content"]) for h in history_dicts]
+    else:
+        history_msgs = list(req.history)
+    # Save user message to DB
+    save_message(session_id, "user", req.message)
+    # ===== END NEW =====
+    # 1) Retrieve context from ChromaDB (YOUR EXISTING CODE)
     top_chunks = await retrieve(query=req.message, k=3)
     context_block = format_context(top_chunks)
-
-    # 2) Build messages
+    # 2) Build messages (YOUR EXISTING CODE)
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "system", "content": context_block},
     ]
-    messages += [m.model_dump() for m in req.history]
+    messages += [m.model_dump() for m in history_msgs]    # ← Changed from req.history
     messages.append({"role": "user", "content": req.message})
-
     try:
-        # 3) Call LLM
+        # 3) Call LLM (YOUR EXISTING CODE)
         reply_text = await ollama_chat(messages)
-
-        # 4) Parse structured JSON
+        # 4) Parse structured JSON (YOUR EXISTING CODE)
         parsed_dict = parse_llm_json(reply_text)
         parsed = ParsedIntent(
             intent=parsed_dict.get("intent", "unclear"),
@@ -156,14 +179,14 @@ async def chat(req: ChatRequest):
             schedule=parsed_dict.get("schedule"),
             confidence=parsed_dict.get("confidence"),
         )
-
         human_reply = parsed_dict.get("reply", reply_text)
-
-        # 5) Update history
-        new_history = list(req.history)
+        # 5) Update history (YOUR EXISTING CODE)
+        new_history = list(history_msgs)    # ← Changed from req.history
         new_history.append(Msg(role="user", content=req.message))
         new_history.append(Msg(role="assistant", content=human_reply))
-
+        # ===== NEW: Save assistant reply to DB =====
+        save_message(session_id, "assistant", human_reply, parsed.model_dump())
+        # ===== END NEW =====
         return ChatResponse(
             reply=human_reply,
             parsed=parsed,
@@ -176,18 +199,22 @@ async def chat(req: ChatRequest):
                 }
                 for c in top_chunks
             ],
+            session_id=session_id,          # ← ADD this
         )
-
     except Exception as e:
-        new_history = list(req.history)
+        new_history = list(history_msgs)    # ← Changed from req.history
         new_history.append(Msg(role="user", content=req.message))
         fallback = f"(Fallback) Could not reach local LLM: {e}"
         new_history.append(Msg(role="assistant", content=fallback))
+        # ===== NEW: Save fallback to DB =====
+        save_message(session_id, "assistant", fallback)
+        # ===== END NEW =====
         return ChatResponse(
             reply=fallback,
             parsed=None,
             history=new_history,
             context_used=None,
+            session_id=session_id,          # ← ADD this
         )
     
 # =========================
@@ -291,3 +318,34 @@ async def upload_document(
     result["original_filename"] = file.filename
 
     return result
+
+
+# =========================
+# Session Management Routes
+# =========================
+
+@app.post("/sessions")
+async def new_session():
+    """Create a new chat session."""
+    return create_session()
+
+
+@app.get("/sessions")
+async def get_sessions():
+    """List all chat sessions."""
+    sessions = list_sessions()
+    return {"sessions": sessions}
+
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    """Get all messages for a session."""
+    messages = get_session_messages(session_id)
+    return {"session_id": session_id, "messages": messages}
+
+
+@app.delete("/sessions/{session_id}")
+async def remove_session(session_id: str):
+    """Delete a chat session."""
+    delete_session(session_id)
+    return {"status": "deleted", "session_id": session_id}
