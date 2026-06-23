@@ -7,16 +7,22 @@ Stores chat history per session so users can continue conversations.
 import sqlite3
 import json
 import uuid
+import threading
 from datetime import datetime
 from typing import List, Dict, Optional
 
 DB_PATH = "conversations.db"
 
+# Thread-safe lock for SQLite writes
+_db_lock = threading.Lock()
+
 
 def get_db():
-    """Get a database connection."""
-    conn = sqlite3.connect(DB_PATH)
+    """Get a database connection with WAL mode and timeout."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)  # ← Wait up to 10 sec if locked
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")       # ← Allow concurrent reads + writes
+    conn.execute("PRAGMA busy_timeout=5000")      # ← Retry for 5 sec if busy
     return conn
 
 
@@ -49,53 +55,54 @@ def init_db():
 
 def create_session() -> Dict:
     """Create a new chat session."""
-    conn = get_db()
-    session_id = str(uuid.uuid4())
-    now = datetime.now().isoformat()
+    with _db_lock:
+        conn = get_db()
+        session_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
 
-    conn.execute(
-        "INSERT INTO sessions (session_id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        (session_id, "New Chat", now, now),
-    )
-    conn.commit()
-    conn.close()
+        conn.execute(
+            "INSERT INTO sessions (session_id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (session_id, "New Chat", now, now),
+        )
+        conn.commit()
+        conn.close()
 
     return {"session_id": session_id, "title": "New Chat", "created_at": now}
 
 
 def save_message(session_id: str, role: str, content: str, parsed_intent: Optional[Dict] = None):
     """Save a message to a session."""
-    conn = get_db()
-    now = datetime.now().isoformat()
+    with _db_lock:
+        conn = get_db()
+        now = datetime.now().isoformat()
+        
+        # Save message
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, parsed_intent, created_at) VALUES (?, ?, ?, ?, ?)",
+            (session_id, role, content, json.dumps(parsed_intent) if parsed_intent else None, now),
+        )
 
-    # Save message
-    conn.execute(
-        "INSERT INTO messages (session_id, role, content, parsed_intent, created_at) VALUES (?, ?, ?, ?, ?)",
-        (session_id, role, content, json.dumps(parsed_intent) if parsed_intent else None, now),
-    )
+        # Update session timestamp and title
+        if role == "user":
+            count = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ? AND role = 'user'",
+                (session_id,),
+            ).fetchone()[0]
 
-    # Update session timestamp and title (use first user message as title)
-    if role == "user":
-        # Check if this is the first user message
-        count = conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND role = 'user'",
-            (session_id,),
-        ).fetchone()[0]
+            if count == 1:
+                title = content[:50] + ("..." if len(content) > 50 else "")
+                conn.execute(
+                    "UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ?",
+                    (title, now, session_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                    (now, session_id),
+                )
 
-        if count == 1:  # Just inserted the first user message
-            title = content[:50] + ("..." if len(content) > 50 else "")
-            conn.execute(
-                "UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ?",
-                (title, now, session_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
-                (now, session_id),
-            )
-
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
 
 
 def get_session_messages(session_id: str) -> List[Dict]:
@@ -147,9 +154,10 @@ def list_sessions(limit: int = 20) -> List[Dict]:
 
 def delete_session(session_id: str) -> bool:
     """Delete a session and all its messages."""
-    conn = get_db()
-    conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-    conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
-    conn.commit()
-    conn.close()
+    with _db_lock:
+        conn = get_db()
+        conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        conn.commit()
+        conn.close()
     return True

@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Literal, Dict, Any, Tuple
 import httpx
@@ -88,12 +89,14 @@ SYSTEM_PROMPT = f"""You are an HVAC control assistant.
 Your job:
 1. Understand the user's intent from their message and conversation history.
 2. Extract structured data.
-3. Respond with a JSON object (and ONLY a JSON object, no extra text).
+3. Respond with a JSON object (and ONLY a JSON object).
+
 
 {INTENT_BLOCK}
 
-RESPONSE FORMAT (strict JSON, no markdown, no explanation outside the JSON):
+RESPONSE FORMAT (strict JSON, no markdown, short human-friendly response in reply parameter):
 {{
+  "reply": "<short human-friendly response>"
   "intent": "<one of the known intents>",
   "zone": "<zone name or null>",
   "value": <number or null>,
@@ -101,7 +104,6 @@ RESPONSE FORMAT (strict JSON, no markdown, no explanation outside the JSON):
   "mode": "<cooling|heating|auto|off|setback or null>",
   "schedule": "<ISO datetime string or natural language time or null>",
   "confidence": <0.0 to 1.0>,
-  "reply": "<short human-friendly response>"
 }}
 
 RULES:
@@ -216,6 +218,83 @@ async def chat(req: ChatRequest):
             context_used=None,
             session_id=session_id,          # ← ADD this
         )
+    
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    # ===== Session management (same as before) =====
+    session_id = req.session_id
+    if not session_id:
+        session = create_session()
+        session_id = session["session_id"]
+
+    if req.session_id:
+        history_dicts = get_session_history(session_id)
+        history_msgs = [Msg(role=h["role"], content=h["content"]) for h in history_dicts]
+    else:
+        history_msgs = list(req.history)
+
+    save_message(session_id, "user", req.message)
+
+    # ===== Build messages (same as before) =====
+    top_chunks = await retrieve(query=req.message, k=3)
+    context_block = format_context(top_chunks)
+
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": context_block},
+    ]
+    messages += [m.model_dump() for m in history_msgs]
+    messages.append({"role": "user", "content": req.message})
+
+    # ===== Stream from Ollama =====
+    async def generate():
+        full_reply = ""
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                async with client.stream(
+                    "POST",
+                    "http://localhost:11434/api/chat",
+                    json={"model": "llama3", "messages": messages, "stream": True},
+                ) as response:
+                    async for line in response.aiter_lines():
+                        if line.strip():
+                            chunk = json.loads(line)
+                            token = chunk.get("message", {}).get("content", "")
+                            full_reply += token
+
+                            # Send raw JSON token (for Developer Chat)
+                            yield f"data: {json.dumps({'token': token, 'session_id': session_id})}\n\n"
+
+                            if chunk.get("done", False):
+                                break
+
+            # Parse intent and extract human reply
+            parsed_dict = parse_llm_json(full_reply)
+            parsed = ParsedIntent(
+                intent=parsed_dict.get("intent", "unclear"),
+                zone=parsed_dict.get("zone"),
+                value=parsed_dict.get("value"),
+                unit=parsed_dict.get("unit"),
+                mode=parsed_dict.get("mode"),
+                schedule=parsed_dict.get("schedule"),
+                confidence=parsed_dict.get("confidence"),
+            )
+
+            human_reply = parsed_dict.get("reply", full_reply)
+
+            # Save to database
+            save_message(session_id, "assistant", human_reply, parsed.model_dump())
+
+            # Send final event with BOTH human reply and parsed intent
+            yield f"data: {json.dumps({'done': True, 'reply': human_reply, 'parsed': parsed.model_dump(), 'session_id': session_id})}\n\n"
+
+        except Exception as e:
+            fallback = f"(Fallback) Could not reach local LLM: {e}"
+            save_message(session_id, "assistant", fallback)
+            yield f"data: {json.dumps({'token': fallback, 'done': True, 'session_id': session_id})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
     
 # =========================
 # Document Management Routes
