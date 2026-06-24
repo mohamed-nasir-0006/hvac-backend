@@ -76,6 +76,12 @@ def save_message(session_id: str, role: str, content: str, parsed_intent: Option
         conn = get_db()
         now = datetime.now().isoformat()
         
+        print(f"[save_message] session_id: {session_id}")
+        print(f"[save_message] role: {role}")
+        print(f"[save_message] content: {content}")
+        print(f"[save_message] parsed_intent: {parsed_intent}")
+        print(f"[save_message] timestamp: {now}")
+        
         # Save message
         conn.execute(
             "INSERT INTO messages (session_id, role, content, parsed_intent, created_at) VALUES (?, ?, ?, ?, ?)",
