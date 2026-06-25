@@ -7,6 +7,7 @@ import httpx
 import json
 from intents import get_intent_prompt_block
 from file_parser import extract_text
+from saas_bridge import execute_intent
 from vector_store import (
     ingest_kb,
     ingest_document,
@@ -236,7 +237,7 @@ async def chat_stream(req: ChatRequest):
 
     save_message(session_id, "user", req.message)
 
-    # ===== Build messages (same as before) =====
+    # ===== Build messages =====
     top_chunks = await retrieve(query=req.message, k=3)
     context_block = format_context(top_chunks)
 
@@ -283,11 +284,28 @@ async def chat_stream(req: ChatRequest):
 
             human_reply = parsed_dict.get("reply", full_reply)
 
+            # ========== 🌉 BRIDGE: Call SaaS Backend ==========
+            bridge_result = None
+            if parsed.intent not in ["unclear", "general", "greeting", None, ""]:
+                try:
+                    bridge_result = execute_intent(parsed.model_dump())
+                    if bridge_result.get("success"):
+                        # Override reply with bridge confirmation
+                        human_reply = bridge_result["reply"]
+                        print(f"[Bridge] ✅ {parsed.intent} executed successfully")
+                    elif bridge_result.get("error"):
+                        human_reply = bridge_result["reply"]
+                        print(f"[Bridge] ❌ {parsed.intent} failed: {bridge_result['error']}")
+                except Exception as e:
+                    print(f"[Bridge] ⚠️ Bridge error: {e}")
+                    # Keep original human_reply if bridge fails
+            # ========== END BRIDGE ==========
+
             # Save to database
             save_message(session_id, "assistant", human_reply, parsed.model_dump())
 
-            # Send final event with BOTH human reply and parsed intent
-            yield f"data: {json.dumps({'done': True, 'reply': human_reply, 'parsed': parsed.model_dump(), 'session_id': session_id})}\n\n"
+            # Send final event with human reply, parsed intent, AND bridge result
+            yield f"data: {json.dumps({'done': True, 'reply': human_reply, 'parsed': parsed.model_dump(), 'bridge': bridge_result, 'session_id': session_id})}\n\n"
 
         except Exception as e:
             fallback = f"(Fallback) Could not reach local LLM: {e}"
