@@ -1,11 +1,11 @@
 # intents.py
-# All known HVAC intents the system can handle
+# All known intents — driven by application domain
 
 KNOWN_INTENTS = [
     {
         "intent": "set_temperature",
         "description": "User wants to set a target temperature for a zone",
-        "fields": ["zone", "value", "unit", "schedule"],
+        "fields": ["zone", "value", "unit"],
     },
     {
         "intent": "get_temperature",
@@ -14,22 +14,32 @@ KNOWN_INTENTS = [
     },
     {
         "intent": "set_mode",
-        "description": "User wants to change HVAC mode (cooling, heating, auto, off, setback)",
+        "description": "User wants to change mode (cooling, heating, auto, off)",
         "fields": ["zone", "mode"],
     },
     {
         "intent": "get_status",
-        "description": "User wants to know the current HVAC system status",
+        "description": "User wants to know the current system status",
         "fields": ["zone"],
     },
     {
-        "intent": "set_schedule",
-        "description": "User wants to create or modify a schedule",
-        "fields": ["zone", "schedule", "value", "unit", "mode"],
+        "intent": "turn_on",
+        "description": "User wants to turn on a zone",
+        "fields": ["zone"],
+    },
+    {
+        "intent": "turn_off",
+        "description": "User wants to turn off a zone",
+        "fields": ["zone"],
+    },
+    {
+        "intent": "get_all_zones",
+        "description": "User wants to see all zones status",
+        "fields": [],
     },
     {
         "intent": "general_question",
-        "description": "User is asking a general HVAC knowledge question (use RAG context)",
+        "description": "User is asking a general knowledge question (use RAG context)",
         "fields": [],
     },
     {
@@ -38,6 +48,7 @@ KNOWN_INTENTS = [
         "fields": [],
     },
 ]
+
 
 def get_intent_prompt_block() -> str:
     """Format intents into a string for the system prompt."""

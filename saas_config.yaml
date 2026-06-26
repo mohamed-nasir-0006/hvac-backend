@@ -1,0 +1,199 @@
+# ============================================
+# SaaS Application Configuration
+# Change ONLY this file to adapt to any domain
+# Supports both YAML and JSON format
+# ============================================
+
+app:
+  name: HVAC Control Assistant
+  description: Smart building climate control system
+  entity_field: zone
+  skip_intents:
+    - unclear
+    - general
+    - general_question
+    - greeting
+
+  intent_fields:
+    intent:
+      type: string
+      default: unclear
+      description: Detected intent
+    zone:
+      type: string
+      default: null
+      description: Zone name
+    value:
+      type: number
+      default: null
+      description: Numeric value
+    unit:
+      type: string
+      default: null
+      description: Unit (C or F)
+    mode:
+      type: string
+      default: null
+      description: Mode (cooling/heating/auto/off)
+    confidence:
+      type: number
+      default: null
+      description: Confidence score 0.0-1.0
+
+  # System prompt template
+  # Variables: {app_name}, {intent_block}, {response_format}
+  system_prompt: |
+    You are a {app_name} assistant.
+
+    Your job:
+    1. Understand the user's intent from their message and conversation history.
+    2. Extract structured data.
+    3. Respond with a JSON object (and ONLY a JSON object).
+
+    {intent_block}
+
+    RESPONSE FORMAT (strict JSON, no markdown, short human-friendly response in reply parameter):
+    {response_format}
+
+    RULES:
+    - Always respond with valid JSON only.
+    - If the user says "yes" or confirms, use conversation history to determine the intent.
+    - If intent is unclear, set intent to "unclear" and ask a clarifying question in "reply".
+    - For general knowledge questions, set intent to "general_question".
+    - Use the CONTEXT (retrieved documents) to answer knowledge questions.
+
+# ============================================
+# Server Configuration
+# ============================================
+server:
+  debug: true
+  cors_origins:
+    - http://localhost:5173
+    - http://127.0.0.1:5173
+  allowed_upload_types:
+    - .pdf
+    - .docx
+    - .txt
+  default_category: general
+
+# ============================================
+# LLM Configuration
+# ============================================
+llm:
+  provider: ollama
+  base_url: http://localhost:11434
+  chat_model: llama3
+  embed_model: nomic-embed-text
+  chat_endpoint: /api/chat
+  embed_endpoint: /api/embed
+  timeout: 120
+
+# ============================================
+# Vector Store Configuration
+# ============================================
+vector_store:
+  provider: chromadb
+  persist_dir: chroma_data
+  collection_name: knowledge_base
+  similarity_metric: cosine
+  chunk_size: 500
+  chunk_overlap: 80
+  kb_file: kb_docs.json
+  default_top_k: 3
+
+# ============================================
+# SaaS Backend Configuration
+# ============================================
+saas_backend:
+  base_url: http://localhost:8001
+
+  # Entity name variations → entity_id mapping
+  entity_map:
+    bedroom: bedroom
+    bed room: bedroom
+    master bedroom: bedroom
+    kitchen: kitchen
+    hall: hall
+    living room: hall
+    living hall: hall
+    office: office
+    home office: office
+    study: office
+
+  # API Endpoints — each endpoint is self-contained
+  endpoints:
+    get_all_zones:
+      method: GET
+      path: /api/zones
+      path_params: {}
+      body: null
+      success_message: "🌡️ {data.name}: {data.temperature}°C | {data.mode} | {data.status}"
+      error_message: "❌ Failed to get zones"
+
+    get_zone:
+      method: GET
+      path: /api/zones/{zone_id}
+      path_params:
+        zone_id: $entity
+      body: null
+      success_message: "🌡️ {entity_name}: {data.temperature}°C | Mode: {data.mode} | Status: {data.status} | Humidity: {data.humidity}%"
+      error_message: "❌ Failed to get zone info"
+
+    set_temperature:
+      method: POST
+      path: /api/zones/{zone_id}/temperature
+      path_params:
+        zone_id: $entity
+      body:
+        temperature: $value
+        changed_by: chat
+      success_message: "✅ {entity_name} temperature set to {value}°C"
+      error_message: "❌ Failed to set temperature"
+
+    set_mode:
+      method: POST
+      path: /api/zones/{zone_id}/mode
+      path_params:
+        zone_id: $entity
+      body:
+        mode: $mode
+        changed_by: chat
+      success_message: "✅ {entity_name} mode set to {mode}"
+      error_message: "❌ Failed to set mode"
+
+    turn_on:
+      method: POST
+      path: /api/zones/{zone_id}/status
+      path_params:
+        zone_id: $entity
+      body:
+        status: "on"
+        changed_by: chat
+      success_message: "✅ {entity_name} turned ON"
+      error_message: "❌ Failed to turn on"
+
+    turn_off:
+      method: POST
+      path: /api/zones/{zone_id}/status
+      path_params:
+        zone_id: $entity
+      body:
+        status: "off"
+        changed_by: chat
+      success_message: "✅ {entity_name} turned OFF"
+      error_message: "❌ Failed to turn off"
+
+    get_zone_logs:
+      method: GET
+      path: /api/zones/{zone_id}/logs
+      path_params:
+        zone_id: $entity
+      body: null
+      success_message: "📋 Logs retrieved for {entity_name}"
+      error_message: "❌ Failed to get logs"
+
+  # Intent aliases — multiple intents → same endpoint
+  intent_aliases:
+    get_temperature: get_zone
+    get_status: get_zone
+    get_all: get_all_zones

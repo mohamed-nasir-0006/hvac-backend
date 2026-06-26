@@ -1,38 +1,41 @@
 # vector_store.py
+"""
+Vector Store
+Handles ChromaDB operations, embeddings, and LLM chat.
+All constants come from saas_config.json via config_loader.
+"""
+
 import chromadb
-from chromadb.config import Settings
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import json
 import httpx
-import asyncio
 
-# =========================
-# Config
-# =========================
-CHROMA_DIR = Path(__file__).parent / "chroma_data"
-COLLECTION_NAME = "hvac_knowledge"
-OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
-EMBED_MODEL = "nomic-embed-text"
-KB_PATH = Path(__file__).parent / "kb_docs.json"
-# =========================
-# Ollama config
-# =========================
-OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-GEN_MODEL = "llama3"
-
+from config_loader import (
+    get_chroma_dir,
+    get_collection_name,
+    get_similarity_metric,
+    get_chunk_size,
+    get_chunk_overlap,
+    get_kb_path,
+    get_embed_url,
+    get_embed_model,
+    get_chat_url,
+    get_chat_model,
+    get_llm_timeout,
+)
 
 # =========================
 # ChromaDB client (persistent)
 # =========================
-client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+client = chromadb.PersistentClient(path=str(get_chroma_dir()))
 
 
 def get_collection():
-    """Get or create the HVAC knowledge collection."""
+    """Get or create the knowledge collection."""
     return client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},  # use cosine similarity
+        name=get_collection_name(),
+        metadata={"hnsw:space": get_similarity_metric()},
     )
 
 
@@ -41,10 +44,10 @@ def get_collection():
 # =========================
 async def ollama_embed(texts: List[str]) -> List[List[float]]:
     """Get embeddings from Ollama."""
-    async with httpx.AsyncClient(timeout=120.0) as http_client:
+    async with httpx.AsyncClient(timeout=float(get_llm_timeout())) as http_client:
         resp = await http_client.post(
-            OLLAMA_EMBED_URL,
-            json={"model": EMBED_MODEL, "input": texts},
+            get_embed_url(),
+            json={"model": get_embed_model(), "input": texts},
         )
         resp.raise_for_status()
         return resp.json()["embeddings"]
@@ -53,8 +56,13 @@ async def ollama_embed(texts: List[str]) -> List[List[float]]:
 # =========================
 # Chunking
 # =========================
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 80) -> List[str]:
-    """Character-based chunking with overlap."""
+def chunk_text(text: str, chunk_size: int = None, overlap: int = None) -> List[str]:
+    """Character-based chunking with overlap. Sizes from config."""
+    if chunk_size is None:
+        chunk_size = get_chunk_size()
+    if overlap is None:
+        overlap = get_chunk_overlap()
+
     text = text.strip()
     if not text:
         return []
@@ -73,34 +81,31 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 80) -> List[str]
 
 
 # =========================
-# Ingest documents into ChromaDB
+# Ingest KB into ChromaDB
 # =========================
 async def ingest_kb(force_reload: bool = False) -> int:
     """
-    Load kb_docs.json, chunk, embed, and store in ChromaDB.
+    Load KB file, chunk, embed, and store in ChromaDB.
     Returns the number of chunks stored.
-    Skips if collection already has data (unless force_reload=True).
     """
     collection = get_collection()
 
-    # Skip if already populated
     if not force_reload and collection.count() > 0:
         print(f"[ChromaDB] Collection already has {collection.count()} chunks. Skipping ingest.")
         return collection.count()
 
-    # Clear existing data if force reloading
     if force_reload and collection.count() > 0:
         print("[ChromaDB] Force reload — clearing existing data.")
-        # Delete all existing IDs
         existing = collection.get()
         if existing["ids"]:
             collection.delete(ids=existing["ids"])
 
-    if not KB_PATH.exists():
-        print(f"[ChromaDB] No KB file found at {KB_PATH}.")
+    kb_path = get_kb_path()
+    if not kb_path.exists():
+        print(f"[ChromaDB] No KB file found at {kb_path}.")
         return 0
 
-    docs = json.loads(KB_PATH.read_text(encoding="utf-8"))
+    docs = json.loads(kb_path.read_text(encoding="utf-8"))
 
     all_chunks: List[str] = []
     all_ids: List[str] = []
@@ -127,10 +132,8 @@ async def ingest_kb(force_reload: bool = False) -> int:
         print("[ChromaDB] No text chunks found in KB.")
         return 0
 
-    # Embed all chunks
     embeddings = await ollama_embed(all_chunks)
 
-    # Upsert into ChromaDB
     collection.upsert(
         ids=all_ids,
         documents=all_chunks,
@@ -147,17 +150,20 @@ async def ingest_kb(force_reload: bool = False) -> int:
 # =========================
 async def retrieve(
     query: str,
-    k: int = 3,
+    k: int = None,
     where_filter: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Embed the query and retrieve top-k similar chunks from ChromaDB.
-    Optionally filter by metadata (e.g., {"category": "hvac_basics"}).
     """
     collection = get_collection()
 
     if collection.count() == 0:
         return []
+
+    if k is None:
+        from config_loader import get_default_top_k
+        k = get_default_top_k()
 
     query_embedding = (await ollama_embed([query]))[0]
 
@@ -171,7 +177,6 @@ async def retrieve(
 
     results = collection.query(**query_params)
 
-    # Format results
     chunks = []
     for i in range(len(results["ids"][0])):
         chunks.append({
@@ -183,8 +188,9 @@ async def retrieve(
 
     return chunks
 
+
 # =========================
-# Ingest a single document via API
+# Ingest a single document
 # =========================
 async def ingest_document(
     source_id: str,
@@ -192,10 +198,7 @@ async def ingest_document(
     text: str,
     category: str = "general",
 ) -> Dict[str, Any]:
-    """
-    Chunk, embed, and store a single document into ChromaDB.
-    Returns info about what was stored.
-    """
+    """Chunk, embed, and store a single document into ChromaDB."""
     collection = get_collection()
 
     chunks = chunk_text(text)
@@ -217,10 +220,8 @@ async def ingest_document(
             "chunk_index": str(idx),
         })
 
-    # Embed
     embeddings = await ollama_embed(documents)
 
-    # Upsert (update if same ID exists, insert if new)
     collection.upsert(
         ids=ids,
         documents=documents,
@@ -239,18 +240,13 @@ async def ingest_document(
 
 
 # =========================
-# Delete a document by source_id
+# Delete a document
 # =========================
 def delete_document(source_id: str) -> Dict[str, Any]:
-    """
-    Remove all chunks belonging to a source_id from ChromaDB.
-    """
+    """Remove all chunks belonging to a source_id."""
     collection = get_collection()
 
-    # Find all chunks with this source_id
-    results = collection.get(
-        where={"source_id": source_id},
-    )
+    results = collection.get(where={"source_id": source_id})
 
     if not results["ids"]:
         return {"status": "not_found", "source_id": source_id, "chunks_deleted": 0}
@@ -266,12 +262,10 @@ def delete_document(source_id: str) -> Dict[str, Any]:
 
 
 # =========================
-# List all documents (unique source_ids)
+# List all documents
 # =========================
 def list_documents() -> List[Dict[str, str]]:
-    """
-    List all unique documents in the collection.
-    """
+    """List all unique documents in the collection."""
     collection = get_collection()
 
     if collection.count() == 0:
@@ -293,27 +287,36 @@ def list_documents() -> List[Dict[str, str]]:
 
 
 # =========================
-# Utility: list all chunks (for debugging)
+# Collection info
 # =========================
 def get_collection_info() -> Dict[str, Any]:
     """Return collection stats."""
-    collection = get_collection()
     return {
-        "name": COLLECTION_NAME,
-        "count": collection.count(),
-        "persist_dir": str(CHROMA_DIR),
+        "name": get_collection_name(),
+        "count": get_collection().count(),
+        "persist_dir": str(get_chroma_dir()),
     }
 
+
+# =========================
+# LLM Chat
+# =========================
 async def ollama_chat(messages: List[Dict[str, str]]) -> str:
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
-            OLLAMA_CHAT_URL,
-            json={"model": GEN_MODEL, "messages": messages, "stream": False},
+    """Send messages to LLM and get response."""
+    async with httpx.AsyncClient(timeout=float(get_llm_timeout())) as http_client:
+        resp = await http_client.post(
+            get_chat_url(),
+            json={"model": get_chat_model(), "messages": messages, "stream": False},
         )
         resp.raise_for_status()
         return resp.json()["message"]["content"]
 
+
+# =========================
+# Context formatter
+# =========================
 def format_context(chunks: List[Dict[str, Any]]) -> str:
+    """Format retrieved chunks as context for LLM."""
     if not chunks:
         return "CONTEXT: (none)\n"
     lines = ["CONTEXT:"]
@@ -324,7 +327,12 @@ def format_context(chunks: List[Dict[str, Any]]) -> str:
         lines.append(f"[{i}] {title} ({source}): {c['text']}")
     return "\n".join(lines) + "\n"
 
+
+# =========================
+# JSON parser
+# =========================
 def parse_llm_json(raw_text: str) -> Dict[str, Any]:
+    """Parse JSON from LLM response."""
     text = raw_text.strip()
     if text.startswith("```"):
         lines = text.split("\n")

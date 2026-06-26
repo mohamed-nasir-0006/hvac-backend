@@ -1,53 +1,123 @@
 # saas_bridge.py
 """
-SaaS Bridge
-Reads saas_config.json and calls hvac-saas-backend APIs
-based on parsed chat intents.
+Generic SaaS Bridge (v3 — Fully Config-Driven)
+Zero application-specific code.
+Everything driven by saas_config.json.
 """
 
 import json
+import re
 import requests
 from typing import Optional, Dict, Any
+from config_loader import SAAS_CONFIG, get_entity_field
 
-# Load config
-with open("saas_config.json", "r") as f:
-    CONFIG = json.load(f)["saas_backend"]
-
-BASE_URL = CONFIG["base_url"]
-ENDPOINTS = CONFIG["endpoints"]
-ZONE_MAP = CONFIG["zone_map"]
+BASE_URL = SAAS_CONFIG["base_url"]
+ENDPOINTS = SAAS_CONFIG["endpoints"]
+ENTITY_MAP = SAAS_CONFIG.get("entity_map", {})
+INTENT_ALIASES = SAAS_CONFIG.get("intent_aliases", {})
 
 
-def resolve_zone_id(zone_name: str) -> Optional[str]:
-    """Map zone name variations to zone_id."""
-    normalized = zone_name.lower().strip()
-    return ZONE_MAP.get(normalized)
+def resolve_entity(name: str) -> Optional[str]:
+    """Map entity name variations to entity_id using config."""
+    if not name:
+        return None
+    normalized = name.lower().strip()
+    return ENTITY_MAP.get(normalized)
 
 
-def build_url(endpoint_name: str, **kwargs) -> str:
-    """Build full URL from config endpoint."""
-    endpoint = ENDPOINTS.get(endpoint_name)
-    if not endpoint:
-        raise ValueError(f"Unknown endpoint: {endpoint_name}")
+def resolve_variable(value: Any, intent_data: Dict) -> Any:
+    """Resolve $variable placeholders to actual values."""
+    if not isinstance(value, str):
+        return value
 
-    path = endpoint["path"].format(**kwargs)
-    return f"{BASE_URL}{path}"
+    if value == "$entity":
+        entity_field = get_entity_field()
+        entity_name = intent_data.get(entity_field) or intent_data.get("entity", "")
+        return resolve_entity(entity_name)
+
+    if value.startswith("$"):
+        field_name = value[1:]
+        resolved = intent_data.get(field_name)
+        if isinstance(resolved, str):
+            try:
+                resolved = float(resolved)
+                if resolved == int(resolved):
+                    resolved = int(resolved)
+            except (ValueError, TypeError):
+                pass
+        return resolved
+
+    return value
 
 
-def call_saas_api(endpoint_name: str, path_params: Dict = None, body: Dict = None) -> Dict[str, Any]:
-    """Call a SaaS backend API using config."""
-    endpoint = ENDPOINTS.get(endpoint_name)
-    if not endpoint:
-        return {"error": f"Unknown endpoint: {endpoint_name}"}
+def resolve_body(body_template: Optional[Dict], intent_data: Dict) -> Optional[Dict]:
+    """Resolve all variables in request body."""
+    if not body_template:
+        return None
+    resolved = {}
+    for key, value in body_template.items():
+        resolved_value = resolve_variable(value, intent_data)
+        if resolved_value is not None:
+            resolved[key] = resolved_value
+    return resolved
 
-    method = endpoint["method"]
-    url = build_url(endpoint_name, **(path_params or {}))
+
+def resolve_path_params(params_template: Dict, intent_data: Dict) -> Dict:
+    """Resolve all variables in path parameters."""
+    resolved = {}
+    for key, value in params_template.items():
+        resolved_value = resolve_variable(value, intent_data)
+        if resolved_value is not None:
+            resolved[key] = resolved_value
+    return resolved
+
+
+def format_message(template: str, intent_data: Dict, api_response: Any = None) -> str:
+    """
+    Format message template with actual values.
+    Dynamically resolves ANY {field} from intent_data
+    and ANY {data.field} from API response.
+    """
+    result = template
+
+    # Replace {entity_name} with the entity field value
+    entity_field = get_entity_field()
+    entity_name = intent_data.get(entity_field) or intent_data.get("entity", "unknown")
+    result = result.replace("{entity_name}", str(entity_name).title())
+
+    # Replace ANY {field} from intent_data — fully dynamic
+    for key, value in intent_data.items():
+        placeholder = f"{{{key}}}"
+        if placeholder in result and value is not None:
+            result = result.replace(placeholder, str(value))
+
+    # Replace {data.field} from API response
+    if api_response and isinstance(api_response, dict):
+        data_fields = re.findall(r'\{data\.(\w+)\}', result)
+        for field in data_fields:
+            field_value = api_response.get(field, "N/A")
+            result = result.replace(f"{{data.{field}}}", str(field_value))
+
+    return result
+
+
+def call_api(method: str, url: str, body: Dict = None) -> Dict[str, Any]:
+    """Make HTTP request."""
+    print(f"[Bridge] 📡 {method} {url}")
+    if body:
+        print(f"[Bridge] 📦 Body: {body}")
 
     try:
         if method == "GET":
             res = requests.get(url, timeout=10)
         elif method == "POST":
             res = requests.post(url, json=body, timeout=10)
+        elif method == "PUT":
+            res = requests.put(url, json=body, timeout=10)
+        elif method == "PATCH":
+            res = requests.patch(url, json=body, timeout=10)
+        elif method == "DELETE":
+            res = requests.delete(url, timeout=10)
         else:
             return {"error": f"Unsupported method: {method}"}
 
@@ -55,142 +125,82 @@ def call_saas_api(endpoint_name: str, path_params: Dict = None, body: Dict = Non
         return {"success": True, "data": res.json()}
 
     except requests.exceptions.ConnectionError:
-        return {"error": "SaaS backend is not reachable"}
+        return {"error": "Backend service is not reachable"}
     except requests.exceptions.Timeout:
-        return {"error": "SaaS backend timed out"}
+        return {"error": "Backend service timed out"}
     except requests.exceptions.HTTPError as e:
         return {"error": f"API error: {e.response.status_code}"}
     except Exception as e:
         return {"error": str(e)}
 
 
-def execute_intent(intent: Dict) -> Dict[str, Any]:
+def execute_intent(intent_data: Dict) -> Dict[str, Any]:
     """
-    Execute a parsed chat intent by calling the appropriate SaaS API.
-    Returns the result to be sent back to the chat user.
+    Execute any intent using unified endpoint config.
+    Zero application-specific code.
     """
-    action = intent.get("intent")
-    zone_name = intent.get("zone", "")
-    value = intent.get("value")
+    action = intent_data.get("intent", "")
 
-    print(f"[Bridge] 🎯 Executing intent: {action} | zone: {zone_name} | value: {value}")
+    # Check aliases
+    resolved_action = INTENT_ALIASES.get(action, action)
 
-    # --- SET TEMPERATURE ---
-    if action == "set_temperature":
-        zone_id = resolve_zone_id(zone_name)
-        if not zone_id:
-            return {"error": f"Unknown zone: {zone_name}", "reply": f"Sorry, I don't recognize the zone '{zone_name}'."}
+    print(f"[Bridge] 🎯 Intent: {action} → Endpoint: {resolved_action}")
 
-        result = call_saas_api(
-            "set_temperature",
-            path_params={"zone_id": zone_id},
-            body={"temperature": value, "changed_by": "chat"},
-        )
+    # Look up endpoint config
+    endpoint_config = ENDPOINTS.get(resolved_action)
+    if not endpoint_config:
+        return {"reply": f"I understood your request but '{action}' is not configured yet."}
 
-        if result.get("success"):
-            zone_data = result["data"].get("zone", {})
+    # Resolve entity
+    entity_field = get_entity_field()
+    entity_name = intent_data.get(entity_field) or intent_data.get("entity", "")
+    path_params_template = endpoint_config.get("path_params", {})
+
+    if entity_name and "$entity" in str(path_params_template.values()):
+        entity_id = resolve_entity(entity_name)
+        if not entity_id:
             return {
-                "success": True,
-                "reply": f"✅ {zone_data.get('name', zone_name)} temperature set to {value}°C",
-                "zone": zone_data,
+                "error": f"Unknown entity: {entity_name}",
+                "reply": f"Sorry, I don't recognize '{entity_name}'."
             }
-        return {"error": result.get("error"), "reply": f"❌ Failed to set temperature: {result.get('error')}"}
 
-    # --- SET MODE ---
-    elif action == "set_mode":
-        zone_id = resolve_zone_id(zone_name)
-        if not zone_id:
-            return {"error": f"Unknown zone: {zone_name}", "reply": f"Sorry, I don't recognize the zone '{zone_name}'."}
+    # Resolve path params and body
+    path_params = resolve_path_params(path_params_template, intent_data)
+    body = resolve_body(endpoint_config.get("body"), intent_data)
 
-        mode = intent.get("mode") or intent.get("value", "")
-        result = call_saas_api(
-            "set_mode",
-            path_params={"zone_id": zone_id},
-            body={"mode": mode.lower(), "changed_by": "chat"},
-        )
+    # Build URL
+    path = endpoint_config["path"].format(**path_params)
+    url = f"{BASE_URL}{path}"
 
-        if result.get("success"):
-            zone_data = result["data"].get("zone", {})
-            return {
-                "success": True,
-                "reply": f"✅ {zone_data.get('name', zone_name)} mode set to {mode}",
-                "zone": zone_data,
-            }
-        return {"error": result.get("error"), "reply": f"❌ Failed to set mode: {result.get('error')}"}
+    # Call API
+    result = call_api(endpoint_config["method"], url, body)
 
-    # --- TURN ON ---
-    elif action == "turn_on":
-        zone_id = resolve_zone_id(zone_name)
-        if not zone_id:
-            return {"error": f"Unknown zone: {zone_name}", "reply": f"Sorry, I don't recognize the zone '{zone_name}'."}
+    # Format response
+    if result.get("success"):
+        api_data = result.get("data", {})
 
-        result = call_saas_api(
-            "set_status",
-            path_params={"zone_id": zone_id},
-            body={"status": "on", "changed_by": "chat"},
-        )
+        # Handle list responses
+        if isinstance(api_data, list):
+            lines = []
+            for item in api_data:
+                line = format_message(endpoint_config["success_message"], intent_data, item)
+                lines.append(line)
+            reply = "\n".join(lines) if lines else endpoint_config["success_message"]
+            return {"success": True, "reply": reply}
 
-        if result.get("success"):
-            zone_data = result["data"].get("zone", {})
-            return {
-                "success": True,
-                "reply": f"✅ {zone_data.get('name', zone_name)} turned ON",
-                "zone": zone_data,
-            }
-        return {"error": result.get("error"), "reply": f"❌ Failed to turn on: {result.get('error')}"}
+        # Handle object responses — find nested entity data
+        nested_data = api_data
+        if isinstance(api_data, dict):
+            # Try common nested keys dynamically
+            for key in api_data:
+                if isinstance(api_data[key], dict):
+                    nested_data = api_data[key]
+                    break
 
-    # --- TURN OFF ---
-    elif action == "turn_off":
-        zone_id = resolve_zone_id(zone_name)
-        if not zone_id:
-            return {"error": f"Unknown zone: {zone_name}", "reply": f"Sorry, I don't recognize the zone '{zone_name}'."}
+        reply = format_message(endpoint_config["success_message"], intent_data, nested_data)
+        return {"success": True, "reply": reply}
 
-        result = call_saas_api(
-            "set_status",
-            path_params={"zone_id": zone_id},
-            body={"status": "off", "changed_by": "chat"},
-        )
-
-        if result.get("success"):
-            zone_data = result["data"].get("zone", {})
-            return {
-                "success": True,
-                "reply": f"✅ {zone_data.get('name', zone_name)} turned OFF",
-                "zone": zone_data,
-            }
-        return {"error": result.get("error"), "reply": f"❌ Failed to turn off: {result.get('error')}"}
-
-    # --- GET TEMPERATURE / STATUS ---
-    elif action in ["get_temperature", "get_status"]:
-        zone_id = resolve_zone_id(zone_name)
-        if not zone_id:
-            return {"error": f"Unknown zone: {zone_name}", "reply": f"Sorry, I don't recognize the zone '{zone_name}'."}
-
-        result = call_saas_api("get_zone", path_params={"zone_id": zone_id})
-
-        if result.get("success"):
-            zone = result["data"]
-            return {
-                "success": True,
-                "reply": f"🌡️ {zone['name']}: {zone['temperature']}°C | Mode: {zone['mode']} | Status: {zone['status']} | Humidity: {zone['humidity']}%",
-                "zone": zone,
-            }
-        return {"error": result.get("error"), "reply": f"❌ Failed to get zone info: {result.get('error')}"}
-
-    # --- GET ALL ZONES ---
-    elif action == "get_all_zones":
-        result = call_saas_api("get_all_zones")
-
-        if result.get("success"):
-            zones = result["data"]
-            lines = [f"🌡️ {z['name']}: {z['temperature']}°C | {z['mode']} | {z['status']}" for z in zones]
-            return {
-                "success": True,
-                "reply": "📊 All Zones:\n" + "\n".join(lines),
-                "zones": zones,
-            }
-        return {"error": result.get("error"), "reply": f"❌ Failed to get zones: {result.get('error')}"}
-
-    # --- UNKNOWN INTENT ---
     else:
-        return {"reply": f"I understood your request but I don't know how to handle '{action}' yet."}
+        error_msg = result.get("error", "Unknown error")
+        reply = f"{endpoint_config['error_message']}: {error_msg}"
+        return {"error": error_msg, "reply": reply}
